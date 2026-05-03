@@ -59,6 +59,7 @@ class CinchMainEnv:
         # Discard the all non-trump cards.
         discarded_cards = []
         self.hands = [[] for _ in range(4)]
+        self.trumps_at_start = [0] * 4
         self.count_from_deck = []
         self.count_from_dead_wood = []
         start_ind = 36
@@ -67,6 +68,7 @@ class CinchMainEnv:
             non_trump_cards = [c for c in hand if c[0] != self.trump]
             discarded_cards.extend(non_trump_cards)
             self.hands[i] = [c for c in hand if c[0] == self.trump]
+            self.trumps_at_start[i] = len(self.hands[i])
             # Everyone must start with 6 cards.
             if len(self.hands[i]) < 6:
                 # Get cards from the remaining deck until we have 6 cards in hand.
@@ -87,11 +89,14 @@ class CinchMainEnv:
                     cards_to_deal = (6 - len(self.hands[i]))
                     self.hands[i].extend(deck[start_ind:start_ind + cards_to_deal])
                     self.count_from_deck.append(cards_to_deal)
+                    self.count_from_dead_wood.append(0)
                     start_ind += cards_to_deal
-            elif len(self.hands[i]) > 6:
+            else:
                 # print(f"Player {i} has {len(self.hands[i])} trump cards. Discarding down to 6 cards.")
                 self.hands[i] = self.hands[i][:6] # Technically up to the user to decide, but this is such a rare case that it shouldn't matter much.
                 discarded_cards.extend(hand[6:])
+                self.count_from_deck.append(0)
+                self.count_from_dead_wood.append(0)
         self.count_in_widow = 52 - start_ind
         # print("Count from deck:", self.count_from_deck)
         # print("Count from dead wood:", self.count_from_dead_wood)
@@ -130,6 +135,7 @@ class CinchMainEnv:
             "trick_pos": len(self.trick),
             "lead_suit": SUITS.index(self.trick[0][0]) if self.trick else -1,
             "void": self.void.flatten(),
+            "trumps_at_start": self.trumps_at_start,
             "count_from_deck": self.count_from_deck,
             "count_from_dead_wood": self.count_from_dead_wood,
             "count_in_widow": self.count_in_widow
@@ -144,8 +150,8 @@ class CinchMainEnv:
             np.array: A binary vector of length 52 where each index corresponds to a card, and the value is 1 if the card is in the current trick, otherwise 0.
         """
         vec = np.zeros(52)
-        for c in self.trick:
-            vec[card_to_index(c)] = 1
+        for i, c in enumerate(self.trick):
+            vec[card_to_index(c)] = i
         return vec
 
     def legal_actions(self):
