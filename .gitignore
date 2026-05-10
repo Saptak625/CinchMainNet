@@ -218,3 +218,8 @@ __marimo__/
 .streamlit/secrets.toml
 
 wandb/
+node_modules/
+
+# Any folder labeled that starts with runs or checkpoints.
+runs*/
+checkpoints*/
