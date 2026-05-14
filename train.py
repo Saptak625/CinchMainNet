@@ -1,6 +1,7 @@
 import os
 import random
 import time
+import math
 import torch
 import torch.optim as optim
 from torch.utils.tensorboard import SummaryWriter
@@ -8,20 +9,24 @@ from collections import defaultdict, deque
 import numpy as np
 import wandb
 from tqdm import tqdm, trange
+import multiprocessing as mp
+from concurrent.futures import ProcessPoolExecutor
 
 from main_env import CinchMainEnv
-from agent import CinchAgent
-from obs_utils import obs_to_tensor
+from agent import CinchTransformer
+from obs_utils import build_transformer_obs
+from time_it import timeit, enable_timer, time_start, time_end
 
 # ================================
 # Config
 # ================================
 WANDB_ENABLED = os.getenv("WANDB_API_KEY") is not None
-EXPERIMENT_NAME = "large_model"
+EXPERIMENT_NAME = "transformer_small_batches"
 
-DEVICE = "cpu"
+DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+EPISODE_RUN_DEVICE = torch.device("cpu") # Run episodes on CPU to avoid GPU memory issues.
 
-LR = 1e-4           # Learning rate
+LR = 2.5e-4         # Learning rate
 GAMMA = 0.99        # Discount factor for rewards
 LAMBDA = 0.95       # GAE lambda
 POLICY_CLIP = 0.2   # PPO policy clip parameter
@@ -31,36 +36,61 @@ TARGET_KL = 0.02    # Target KL divergence for early stopping in PPO epochs
 # ================================
 # PPO update
 # ================================
-PPO_EPOCHS = 6
-TARGET_TRANSITIONS = 9600 # Each episode has 24 transitions (6 tricks x 4 players), so this corresponds to 400 episodes per PPO update.
-MINIBATCH_SIZE = 2400 # Each batch has 9600 transitions, so this corresponds to 4 minibatches per PPO epoch.
+PPO_EPOCHS = 4
+TARGET_TRANSITIONS = 4800 # Each episode has 24 transitions (6 tricks x 4 players), so this corresponds to 200 episodes per PPO update.
+MINIBATCH_SIZE = 600 # Each batch has 4800 transitions, so this corresponds to 4 minibatches per PPO epoch.
 ENTROPY_COEF = 0.02
-VALUE_COEF = 1.0
+VALUE_COEF = 0.5
 
 MAX_UPDATES = 50_000
 
 LOG_INTERVAL = 10
-CHECKPOINT_INTERVAL = 100
-EVALUATE_INTERVAL = 50
+CHECKPOINT_INTERVAL = 50
+EVALUATE_INTERVAL = 20
 
 CHECKPOINT_DIR = f"checkpoints_{EXPERIMENT_NAME}"
 LOG_DIR = f"runs_{EXPERIMENT_NAME}/cinch"
 
 os.makedirs(CHECKPOINT_DIR, exist_ok=True)
 
+# ===============================
+# Worker Initialization
+# ===============================
+def init_worker(model_state_dict):
+    """
+    Each worker gets:
+    - its own environment
+    - its own independent model copy
 
-# ================================
-# Mask illegal actions
-# ================================
-def mask_logits(logits, legal_actions):
-    mask = torch.full_like(logits, -1e9)
-    mask[legal_actions] = 0.0
-    return logits + mask
+    This prevents wandb parameter tracking conflicts.
+
+    Parameters:
+    - model_state_dict: The state dict of the model to load for the worker.
+    Returns:
+    - worker_env: A new instance of the Cinch environment for the worker.
+    - worker_model: A new instance of the CinchTransformer model with the state dict loaded.
+    """
+    torch.set_num_threads(1)
+
+    worker_env = CinchMainEnv()
+
+    worker_model = CinchTransformer(
+        d_model=96,
+        nhead=4,
+        num_layers=3,
+        dim_feedforward=256
+    ).to(EPISODE_RUN_DEVICE)
+
+    worker_model.load_state_dict(model_state_dict)
+    worker_model.eval()
+
+    return worker_env, worker_model
 
 
 # ================================
 # Run one episode
 # ================================
+@timeit
 def run_episode(env, model):
     """
     Run one episode and collect transitions for PPO.
@@ -76,7 +106,6 @@ def run_episode(env, model):
         - "log_prob": The log probability of the action under the policy at the time of action selection.
         - "value": The value estimate for the state before taking the action.
         - "reward": The reward received after taking the action (given at the end of the trick).
-        - "legal": A binary vector indicating which actions were legal at the time of action selection.
     - epsode_rewards: A list of total rewards for each player at the end of the episode.
     - bet_points: The bet points for the episode, which can be useful for monitoring trends in bet points over time.
     """
@@ -88,60 +117,60 @@ def run_episode(env, model):
     # Track total reward per player for logging
     episode_rewards = [0.0] * 4
 
-    legal_actions_list = []
     players = []
     observations = []
     actions = []
     dists = []
     values = []
     while not done:
+        time_start("run_episode_step")
         player = obs["player"]
 
-        x = obs_to_tensor(obs).to(DEVICE)
+        input_dict = build_transformer_obs(obs)
+        cards = input_dict["cards"].to(EPISODE_RUN_DEVICE)
+        global_features = input_dict["global"].to(EPISODE_RUN_DEVICE)
 
+        time_start("model_forward")
         with torch.no_grad():
-            logits, value = model(x)
+            logits, value = model(cards, global_features)
+        time_end("model_forward")
 
-        legal = env.legal_actions()
-        logits = mask_logits(logits, legal)
-
+        time_start("action_selection")
         dist = torch.distributions.Categorical(logits=logits)
         action = dist.sample()
+        time_end("action_selection")
 
-        legal_actions_list.append(legal)
         players.append(player)
-        observations.append(x)
+        observations.append(input_dict)
         actions.append(action)
         dists.append(dist)
         values.append(value)
 
         next_obs, rewards, done, _ = env.step(action.item())
         obs = next_obs
+        time_end("run_episode_step")
 
+        time_start("end_of_trick_processing")
         # The rewards are given after the end of each trick, so memory is updated after the end of the trick.
         if len(actions) == 4:
-            for l, p, o, a, d, v in zip(legal_actions_list, players, observations, actions, dists, values):
+            for p, o, a, d, v in zip(players, observations, actions, dists, values):
                 step_reward = rewards[p]
                 episode_rewards[p] += step_reward
-
-                legal_mask = np.zeros(52, dtype=np.float32)
-                legal_mask[l] = 1.0
 
                 memory[p].append({
                     "obs": o,
                     "action": a,
                     "log_prob": d.log_prob(a),
                     "value": v.squeeze(),
-                    "reward": step_reward,
-                    "legal": legal_mask
+                    "reward": step_reward
                 })
 
-            legal_actions_list = []
             players = []
             observations = []
             actions = []
             dists = []
             values = []
+        time_end("end_of_trick_processing")
 
     return memory, episode_rewards, env.bet_points
 
@@ -149,18 +178,46 @@ def run_episode(env, model):
 # ================================
 # Collect experience in parallel
 # ================================
-# def collect_experience(args):
-#     # This helper function allows the Pool to run run_episode
-#     env, model = args
-#     memory, rewards, bet_points = run_episode(env, model)
+def collect_experience(model_state_dict, n):
+    """
+    This helper function is used to collect experience in parallel using multiple processes. Each process will run n episodes and return the collected memory, rewards, and bet points.
     
-#     # Calculate GAE locally on the worker to keep the main process light
-#     for p in range(4):
-#         eps_adv, eps_returns = compute_gae(memory[p])
-#         for i, step in enumerate(memory[p]):
-#             step["return"] = eps_returns[i]
-#             step["advantage"] = eps_adv[i]
-#     return memory, rewards, bet_points
+    Parameters:
+    - model_state_dict: The state dictionary of the model.
+    - n: The number of episodes to run in this worker process. 
+
+    Returns:
+    A tuple with 3 lists of length n (number of episodes). The list elements are:
+    - memory: A dictionary mapping player index to a list of transitions collected from the episode. Each transition is a dictionary containing:
+        - "obs": The observation tensor for the state before taking the action.
+        - "action": The action taken by the agent.
+        - "log_prob": The log probability of the action under the policy at the time of action selection.
+        - "value": The value estimate for the state before taking the action.
+        - "return": The return estimate for the state (calculated using GAE).
+        - "advantage": The advantage estimate for the state (calculated using GAE).
+        - "reward": The reward received after taking the action (given at the end of the trick).
+    - rewards: A list of total rewards for each player at the end of the episode.
+    - bet_points: A list of total bet points for each player at the end of the episode.
+    """
+    # This helper function allows the Pool to run run_episode
+    env, model = init_worker(model_state_dict)
+
+    memory_list = []
+    rewards_list = []
+    bet_points_list = []
+    for _episode in trange(n, desc="Collecting experience", unit="episode"):
+        memory, rewards, bet_points = run_episode(env, model)
+        
+        # Calculate GAE locally on the worker to keep the main process light
+        for p in range(4):
+            eps_adv, eps_returns = compute_gae(memory[p])
+            for i, step in enumerate(memory[p]):
+                step["return"] = eps_returns[i]
+                step["advantage"] = eps_adv[i]
+        memory_list.append(memory)
+        rewards_list.append(rewards)
+        bet_points_list.append(bet_points)
+    return memory_list, rewards_list, bet_points_list
 
 
 # ================================
@@ -213,7 +270,6 @@ def update(model, optimizer, memory):
         - "return": The return estimate for the state (calculated using GAE).
         - "advantage": The advantage estimate for the state (calculated using GAE).
         - "reward": The reward received after taking the action (given at the end of the trick).
-        - "legal": A binary vector indicating which actions were legal at the time of action selection.
 
     Returns:
     - num_updates: The number of PPO updates performed (number of minibatches processed).
@@ -235,7 +291,6 @@ def update(model, optimizer, memory):
     # old_values_batch = []
     returns_batch = []
     adv_batch = []
-    legal_mask_batch = []
 
     for p in range(4):
         steps = memory[p]
@@ -250,12 +305,13 @@ def update(model, optimizer, memory):
             # old_values_batch.append(step["value"])
             returns_batch.append(step["return"])
             adv_batch.append(step["advantage"])
-            legal_mask_batch.append(step["legal"])
 
     # ==========================================
     # Convert to tensors
     # ==========================================
-    obs_batch = torch.stack(obs_batch).to(DEVICE)
+    # obs_batch = torch.stack(obs_batch).to(DEVICE)
+    cards_batch = torch.stack([o["cards"] for o in obs_batch]).to(DEVICE)
+    global_batch = torch.stack([o["global"] for o in obs_batch]).to(DEVICE)
 
     action_batch = torch.stack(action_batch).to(DEVICE)
 
@@ -270,11 +326,6 @@ def update(model, optimizer, memory):
 
     adv_batch = torch.tensor(
         adv_batch,
-        dtype=torch.float32
-    ).to(DEVICE)
-
-    legal_mask_batch = torch.tensor(
-        np.array(legal_mask_batch),
         dtype=torch.float32
     ).to(DEVICE)
 
@@ -330,7 +381,10 @@ def update(model, optimizer, memory):
 
             mb_idx = indices[start:end]
 
-            mb_obs = obs_batch[mb_idx]
+            # mb_obs = obs_batch[mb_idx]
+            mb_cards = cards_batch[mb_idx]
+
+            mb_global = global_batch[mb_idx]
 
             mb_actions = action_batch[mb_idx]
 
@@ -342,17 +396,12 @@ def update(model, optimizer, memory):
 
             mb_adv = adv_batch[mb_idx]
 
-            mb_legal = legal_mask_batch[mb_idx]
-
             # ==================================
             # Forward pass
             # ==================================
-            logits, values = model(mb_obs)
-
-            # Mask illegal actions
-            logits = logits.masked_fill(
-                ~mb_legal.bool(),
-                -1e9
+            logits, values = model(
+                mb_cards,
+                mb_global
             )
 
             dist = torch.distributions.Categorical(
@@ -427,7 +476,7 @@ def update(model, optimizer, memory):
             # ).mean()
 
             value_loss = (
-                mb_returns - values.squeeze()
+                mb_returns - values
             ).pow(2).mean()
 
             returns_var = torch.var(mb_returns)
@@ -435,7 +484,7 @@ def update(model, optimizer, memory):
             if returns_var > 1e-8:
                 explained_variance = (
                     1.0
-                    - torch.var(mb_returns - values.squeeze())
+                    - torch.var(mb_returns - values)
                     / returns_var
                 )
             else:
@@ -444,6 +493,7 @@ def update(model, optimizer, memory):
             # ==================================
             # Total loss
             # ==================================
+            ENTROPY_COEF = max(0.003, 0.02 * (0.9996 ** update_num))
             loss = (
                 policy_loss
                 + VALUE_COEF * value_loss
@@ -491,15 +541,24 @@ def update(model, optimizer, memory):
     # ==========================================
     # Average metrics across minibatches
     # ==========================================
+    if num_updates > 0:
+        total_loss /= num_updates
+        total_policy_loss /= num_updates
+        total_value_loss /= num_updates
+        total_entropy /= num_updates
+        total_kl /= num_updates
+        total_clip_fraction /= num_updates
+        total_explained_variance /= num_updates
+
     return (
         num_updates,
-        total_loss / num_updates,
-        total_policy_loss / num_updates,
-        total_value_loss / num_updates,
-        total_entropy / num_updates,
-        total_kl / num_updates,
-        total_clip_fraction / num_updates,
-        total_explained_variance / num_updates
+        total_loss,
+        total_policy_loss,
+        total_value_loss,
+        total_entropy,
+        total_kl,
+        total_clip_fraction,
+        total_explained_variance
     )
 
 
@@ -559,12 +618,12 @@ def evaluate_vs_random(model, games=500):
             # Team 0 uses trained model
             if current_player % 2 == 0:
 
-                x = obs_to_tensor(obs).to(DEVICE)
+                input_dict = build_transformer_obs(obs)
+                cards = input_dict["cards"].to(DEVICE)
+                global_features = input_dict["global"].to(DEVICE)
 
                 with torch.no_grad():
-                    logits, _ = model(x)
-
-                logits = mask_logits(logits, legal)
+                    logits, _ = model(cards, global_features)
 
                 dist = torch.distributions.Categorical(
                     logits=logits
@@ -594,9 +653,12 @@ def evaluate_vs_random(model, games=500):
 # Training loop
 # ================================
 if __name__ == "__main__":
+    # enable_timer()
     env = CinchMainEnv()
 
-    input_size = len(obs_to_tensor(env.reset()))
+    input_dict = build_transformer_obs(env.reset())
+    cards = input_dict["cards"].to(DEVICE)
+    global_features = input_dict["global"].to(DEVICE)
 
     if WANDB_ENABLED:
         wandb.init(
@@ -609,10 +671,18 @@ if __name__ == "__main__":
             name=EXPERIMENT_NAME
         )
 
-    model = CinchAgent(input_size).to(DEVICE)
+    model = CinchTransformer(
+        d_model=96,
+        nhead=4,
+        num_layers=3,
+        dim_feedforward=256
+    ).to(DEVICE)
     optimizer = optim.Adam(model.parameters(), lr=LR)
 
-    wandb.watch(model, log="all", log_freq=100, log_graph=True)
+    mp.set_start_method("spawn", force=True)
+
+    if WANDB_ENABLED:
+        wandb.watch(model, log="all", log_freq=100, log_graph=True)
 
     writer = SummaryWriter(LOG_DIR)
 
@@ -622,48 +692,76 @@ if __name__ == "__main__":
     bet_points_1 = deque(maxlen=1000)
     bet_points_2 = deque(maxlen=1000)
 
-    print(f"Input size: {input_size}")
+    print(f"Card size: {cards.size()}")
+    print(f"Global features size: {global_features.size()}")
     print(f"Device: {DEVICE}")
+    print(f"Episode run device: {EPISODE_RUN_DEVICE}")
 
     # ==========================================
     # PPO batch settings
     # ==========================================
-
     update_num = 0
     episode = 0
 
     while update_num < MAX_UPDATES:
+        # ==========================================
+        # Multiprocessing pool
+        # ==========================================
+        batch_collection_start_time = time.time()
+        target_episodes = TARGET_TRANSITIONS // 24
+
+        # Each worker must do at least 20 episodes
+        episodes_per_worker = 20
+        required_workers = math.ceil(target_episodes / episodes_per_worker)
+        num_workers = min(20, required_workers)
+
+        # Redistribute episodes evenly
+        base_episodes = target_episodes // num_workers
+        remainder = target_episodes % num_workers
+
+        worker_episode_counts = [
+            base_episodes + (1 if i < remainder else 0)
+            for i in range(num_workers)
+        ]
+
+        print(f"Using {num_workers} workers")
+        print(f"Episodes per worker: {worker_episode_counts}")
+
+        # Make workers by calling init_worker with the latest model parameters
+        pool_memory = []
+        pool_rewards = []
+        pool_bet_points = []
+        with ProcessPoolExecutor(max_workers=num_workers) as executor:
+            state_dict = model.state_dict()
+            # Each worker runs its assigned number of episodes and returns its collected memory, rewards, and bet points
+            results = list(executor.map(
+                collect_experience,
+                [state_dict] * num_workers,
+                worker_episode_counts
+            ))
+
+            for r in results:
+                pool_memory.extend(r[0])
+                pool_rewards.extend(r[1])
+                pool_bet_points.extend(r[2])
+
 
         # ==========================================
         # Collect large PPO batch
         # ==========================================
         batch_memory = defaultdict(list)
-
         transitions_collected = 0
-
-        batch_collection_start_time = time.time()
-        for _ in range(TARGET_TRANSITIONS // 24): # Each episode has 24 transitions (6 tricks x 4 players)
-            memory, rewards, bet_points = run_episode(env, model)
-
+        for memory, rewards, bet_points in zip(pool_memory, pool_rewards, pool_bet_points):
             # --------------------------------------
-            # Calculate GAE and merge memory
+            # Merge memory
             # --------------------------------------
-            for p in range(4):
-                # Calculate GAE for THIS game only (6 steps)
-                eps_adv, eps_returns = compute_gae(memory[p])
-                
-                # Attach these specific advantages to the memory steps
-                for i, step in enumerate(memory[p]):
-                    step["return"] = eps_returns[i]
-                    step["advantage"] = eps_adv[i]
-                    batch_memory[p].append(step)
+            for p in range(4):                
+                batch_memory[p].extend(memory[p])
 
             # --------------------------------------
             # Count transitions
             # --------------------------------------
-            transitions_collected += sum(
-                len(memory[p]) for p in range(4)
-            )
+            transitions_collected += 24 # Each episode has 24 transitions (6 tricks x 4 players)
 
             # --------------------------------------
             # Logging metrics
@@ -724,20 +822,21 @@ if __name__ == "__main__":
                 update_num
             )
 
-            wandb.log({
-                "benchmark/avg_bet_points":
-                    benchmark["avg_bet_points"],
-                "update_step": update_num
-            })
+            if WANDB_ENABLED:
+                wandb.log({
+                    "benchmark/avg_bet_points":
+                        benchmark["avg_bet_points"],
+                    "update_step": update_num
+                })
 
-            benchmark_hist = wandb.Histogram(
-                np.array(benchmark["bet_points_list"])
-            )
+                benchmark_hist = wandb.Histogram(
+                    np.array(benchmark["bet_points_list"])
+                )
 
-            wandb.log({
-                "benchmark/bet_points": benchmark_hist,
-                "update_step": update_num
-            })
+                wandb.log({
+                    "benchmark/bet_points": benchmark_hist,
+                    "update_step": update_num
+                })
 
         # ==========================================
         # Logging
@@ -758,17 +857,18 @@ if __name__ == "__main__":
                 f"Bet2 {avg_bet_points_2:.3f}"
             )
 
-            wandb.log({
-                "loss/total": loss,
-                "loss/policy": p_loss,
-                "loss/value": v_loss,
-                "entropy": entropy,
-                "ppo/optimization_steps": optimization_steps,
-                "ppo/kl_divergence": kl,
-                "ppo/clip_fraction": clip_frac,
-                "value/explained_variance": explained_var,
-                "update_step": update_num,
-            })
+            if WANDB_ENABLED:
+                wandb.log({
+                    "loss/total": loss,
+                    "loss/policy": p_loss,
+                    "loss/value": v_loss,
+                    "entropy": entropy,
+                    "ppo/optimization_steps": optimization_steps,
+                    "ppo/kl_divergence": kl,
+                    "ppo/clip_fraction": clip_frac,
+                    "value/explained_variance": explained_var,
+                    "update_step": update_num,
+                })
 
             writer.add_scalar(
                 "Loss/total",
@@ -860,18 +960,19 @@ if __name__ == "__main__":
                 update_num
             )
 
-            # Make a histogram of bet points distribution in wandb
-            bet_points_hist_1 = wandb.Histogram(
-                np.array(bet_points_1)
-            )
-            bet_points_hist_2 = wandb.Histogram(
-                np.array(bet_points_2)
-            )
-            wandb.log({
-                "Bet Points/Model 1": bet_points_hist_1,
-                "Bet Points/Model 2": bet_points_hist_2,
-                "update_step": update_num
-            })
+            if WANDB_ENABLED:
+                # Make a histogram of bet points distribution in wandb
+                bet_points_hist_1 = wandb.Histogram(
+                    np.array(bet_points_1)
+                )
+                bet_points_hist_2 = wandb.Histogram(
+                    np.array(bet_points_2)
+                )
+                wandb.log({
+                    "Bet Points/Model 1": bet_points_hist_1,
+                    "Bet Points/Model 2": bet_points_hist_2,
+                    "update_step": update_num
+                })
 
         # ==========================================
         # Checkpoints

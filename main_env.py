@@ -1,9 +1,11 @@
 import numpy as np
 import random
 
+from time_it import timeit
+
 SUITS = ["H", "D", "C", "S"] # Hearts, Diamonds, Clubs, Spades
 RANKS = ["2","3","4","5","6","7","8","9","10","J","Q","K","A"]
-REWARDS_SCALE = 0.1
+REWARDS_SCALE = 0.01
 
 def create_deck():
     """
@@ -28,6 +30,7 @@ def card_to_index(card):
     return SUITS.index(s) * 13 + RANKS.index(r)
 
 class CinchMainEnv:
+    @timeit
     def __init__(self, debug=False):
         """
         Initializes the Cinch environment.
@@ -41,6 +44,7 @@ class CinchMainEnv:
         self.debug = debug
         self.reset()
 
+    @timeit
     def reset(self, no_reset=False):
         """
         Resets the environment to the initial state for a new episode.
@@ -115,9 +119,10 @@ class CinchMainEnv:
                 print("Cards in widow:", self.count_in_widow)
             self.starting_hands = [list(hand) for hand in self.hands]  # Keep a copy of the initial hands for reward calculation
             self.cards_played = np.zeros(52)
+            self.cards_played_by = np.zeros(52) + 4 # player index who played the card, 4 if not played yet
+            self.trumps_at_least = self.trumps_at_start.copy()
             self.void = np.zeros((4, 4))  # player x suit
             self.card_num = 0
-
             self.current_player = 0
             self.trick = []
             self.rewards = [0] * 4
@@ -126,6 +131,7 @@ class CinchMainEnv:
 
         return self._get_obs()
 
+    @timeit
     def _get_obs(self):
         """
         Constructs the observation for the current player, including their hand, the trump suit, and the current trick.
@@ -158,6 +164,7 @@ class CinchMainEnv:
 
         obs = {
             "hand": hand_vec,
+            "legal_actions": legal,
             "trump": SUITS.index(self.trump),
             "trick": self._encode_trick(),
             "player": self.current_player,
@@ -165,10 +172,12 @@ class CinchMainEnv:
             "trick_value": (total_points + 20 * len(trump_cards)) / 50, # The value of the current trick based on the cards played so far.
             "can_win_mask": can_win_mask,
             "cards_played": self.cards_played,
+            "cards_played_by": self.cards_played_by,
             "trick_pos": len(self.trick),
             "lead_suit": SUITS.index(self.trick[0][0]) if self.trick else -1,
             "void": self.void.flatten(),
             "trumps_at_start": self.trumps_at_start,
+            "trumps_at_least": self.trumps_at_least,
             "count_from_deck": self.count_from_deck,
             "count_from_dead_wood": self.count_from_dead_wood,
             "count_in_widow": self.count_in_widow
@@ -200,6 +209,7 @@ class CinchMainEnv:
             return [card_to_index(c) for c in self.hands[self.current_player] if c[0] == lead_suit]
         return [card_to_index(c) for c in self.hands[self.current_player]]
 
+    @timeit
     def step(self, action):
         """
         Executes the given action (playing a card) and updates the environment state accordingly.
@@ -221,6 +231,10 @@ class CinchMainEnv:
         self.trick.append(card)
         self.card_num += 1
         self.cards_played[action] = self.card_num
+        self.cards_played_by[action] = self.current_player
+
+        if card[0] == self.trump:
+            self.trumps_at_least[self.current_player] = max(0, self.trumps_at_least[self.current_player] - 1)
 
         if len(self.trick) == 4:
             winner = self._resolve_trick()
@@ -308,10 +322,10 @@ class CinchMainEnv:
             if self.debug:
                 print(f"Trick won by player {winner} with cards {[c[1] + c[0] for c in self.trick]}. Total points in trick: {total_points}. Point cards in trick: {[c[1] + c[0] for c in trump_cards]}")
 
-            self.rewards[winner] += 0.5 * total_points * REWARDS_SCALE
-            self.rewards[winner] += 10 * len(trump_cards) * REWARDS_SCALE  # Give extra reward for point cards in trick
-            self.rewards[(winner + 2) % 4] += 0.5 * total_points * REWARDS_SCALE
-            self.rewards[(winner + 2) % 4] += 10 * len(trump_cards) * REWARDS_SCALE  # Give extra reward for point cards in trick
+            self.rewards[winner] += 0.25 * total_points * REWARDS_SCALE
+            self.rewards[winner] += 5 * len(trump_cards) * REWARDS_SCALE  # Give extra reward for point cards in trick
+            self.rewards[(winner + 2) % 4] += 0.25 * total_points * REWARDS_SCALE
+            self.rewards[(winner + 2) % 4] += 5 * len(trump_cards) * REWARDS_SCALE  # Give extra reward for point cards in trick
 
             # for c in trick_point_cards + trump_cards:
             #     ind = self.trick.index(c)
@@ -352,8 +366,8 @@ class CinchMainEnv:
                     if self.debug:
                         print(f"Player {i} has the lowest trump: {lowest_trump}. Awarding 100 points to player {i} and their partner.")
                     bet_points[i % 2] += 1
-                    self.rewards[i] += 15 * REWARDS_SCALE
-                    self.rewards[(i + 2) % 4] += 15 * REWARDS_SCALE
+                    self.rewards[i] += 50 * REWARDS_SCALE
+                    self.rewards[(i + 2) % 4] += 50 * REWARDS_SCALE
 
         # Give 100 points for ace of trump
         ace_of_trump = (self.trump, "A")
@@ -363,8 +377,8 @@ class CinchMainEnv:
                     if self.debug:
                         print(f"Player {i} has the ace of trump: {ace_of_trump}. Awarding 100 points to player {i} and their partner.")
                     bet_points[i % 2] += 1
-                    self.rewards[i] += 15 * REWARDS_SCALE
-                    self.rewards[(i + 2) % 4] += 15 * REWARDS_SCALE
+                    self.rewards[i] += 50 * REWARDS_SCALE
+                    self.rewards[(i + 2) % 4] += 50 * REWARDS_SCALE
 
         # Give 100 points for jack of trump
         jack_of_trump = (self.trump, "J")
@@ -374,8 +388,8 @@ class CinchMainEnv:
                     if self.debug:
                         print(f"Player {i} has the jack of trump: {jack_of_trump}. Awarding 100 points to player {i} and their partner.")
                     bet_points[i % 2] += 1
-                    self.rewards[i] += 15 * REWARDS_SCALE
-                    self.rewards[(i + 2) % 4] += 15 * REWARDS_SCALE
+                    self.rewards[i] += 50 * REWARDS_SCALE
+                    self.rewards[(i + 2) % 4] += 50 * REWARDS_SCALE
 
         # Give 100 points for game (most points in cards won)
         sum_points = [0] * 4
@@ -391,14 +405,14 @@ class CinchMainEnv:
             if self.debug:
                 print("Team 0 (Players 0 and 2) wins the game. Awarding 100 points to players 0 and 2.")
             bet_points[0] += 1
-            self.rewards[0] += 15 * REWARDS_SCALE
-            self.rewards[2] += 15 * REWARDS_SCALE
+            self.rewards[0] += 50 * REWARDS_SCALE
+            self.rewards[2] += 50 * REWARDS_SCALE
         elif points_per_team[1] > points_per_team[0]:
             if self.debug:
                 print("Team 1 (Players 1 and 3) wins the game. Awarding 100 points to players 1 and 3.")
             bet_points[1] += 1
-            self.rewards[1] += 15 * REWARDS_SCALE
-            self.rewards[3] += 15 * REWARDS_SCALE
+            self.rewards[1] += 50 * REWARDS_SCALE
+            self.rewards[3] += 50 * REWARDS_SCALE
         
         if self.debug:
             print("Final bet points for each team:", bet_points)
@@ -421,6 +435,8 @@ class CinchMainEnv:
         new_env.count_in_widow = self.count_in_widow
         new_env.starting_hands = [list(hand) for hand in self.starting_hands]
         new_env.cards_played = np.copy(self.cards_played)
+        new_env.cards_played_by = np.copy(self.cards_played_by)
+        new_env.trumps_at_least = list(self.trumps_at_least)
         new_env.void = np.copy(self.void)
         new_env.card_num = self.card_num
         new_env.current_player = self.current_player
